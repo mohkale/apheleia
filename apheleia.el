@@ -389,18 +389,29 @@ as its sole argument."
                       ;; changes, and 2 if error.
                       (memq status '(0 1)))))))
 
-(defun apheleia--run-formatter (command callback)
-  "Run a code formatter on the current buffer.
-The formatter is specified by COMMAND, a list of strings or
-symbols (see `apheleia-format-buffer'). Invoke CALLBACK with one
-argument, a buffer containing the output of the formatter.
+(defun apheleia--format-command (command &optional stdin)
+  "Format COMMAND into a shell-ccmd and list of file paths.
+Should return a list with the car being the optional input file-name
+the cadr being the optional output file-name and the cddr being the
+cmd to run.
 
-If COMMAND uses the symbol `file' and the current buffer is
-modified from what is written to disk, then don't do anything."
+STDIN is the optional buffer to use when creating a temporary file for
+the formatters standard input.
+
+If COMMAND uses the symbol `file' and the current buffer is modified
+from what is written to disk, then return nil meaning meaning no
+cmd is to be run."
+  ;; WARN: The condition with regards to `file' only checks the original
+  ;; file so it doesn't apply the formats from multiple formatters being
+  ;; run. For example if formatter 1 produces some output and formatter
+  ;; 2 modifies file in place then the changes from formatter 1 may not
+  ;; apply at all.
   (cl-block nil
     (let ((input-fname nil)
           (output-fname nil)
           (npx nil))
+      ;; TODO: Support arbitrary package managers, not just npx.
+      ;; TODO: Should we do this only when npx is at the car of cmd?
       (when (memq 'npx command)
         (setq npx t)
         (setq command (remq 'npx command)))
@@ -434,7 +445,8 @@ modified from what is written to disk, then don't do anything."
                             (and buffer-file-name
                                  (file-name-extension
                                   buffer-file-name 'period)))))
-          (apheleia--write-region-silently nil nil input-fname)
+          (with-current-buffer (or stdin (current-buffer))
+            (apheleia--write-region-silently nil nil input-fname))
           (setq command (mapcar (lambda (arg)
                                   (if (eq arg 'input)
                                       input-fname
@@ -447,15 +459,49 @@ modified from what is written to disk, then don't do anything."
                                     output-fname
                                   arg))
                               command)))
+      `(,input-fname ,output-fname ,@command))))
+
+(defun apheleia--run-formatters (commands callback &optional stdin)
+  "Run one or more code formatters on the current buffer.
+The formatter is specified by the COMMANDS list. Each entry in
+COMMANDS should be a list of strings or symbols (see
+`apheleia-format-buffer'). Once all the formatters in COMMANDS
+finish succesfully then invoke CALLBACK with one argument, a
+buffer containing the output of all the formatters.
+
+STDIN is a buffer containing the standard input for the first
+formatter in COMMANDS. This should not be supplied by the caller
+and instead is supplied by this command when invoked recursively.
+The stdout of the previous formatter becomes the stdin of the
+next formatter."
+  ;; WARN: Is there a chance that current-buffer will change when invoked
+  ;; recursively? Say when first called current-buffer is the input file
+  ;; buffer, when called again is it still the original file buffer?
+  ;;
+  ;; To summarise: Does emacs persists current-buffer with lexical scoping?
+  (when-let ((ret (apheleia--format-command (car commands) stdin)))
+    (cl-destructuring-bind (input-fname output-fname &rest command) ret
       (apheleia--make-process
        :command command
        :stdin (unless input-fname
-                (current-buffer))
-       :callback (lambda (stdout)
-                   (when output-fname
-                     (erase-buffer)
-                     (insert-file-contents-literally output-fname))
-                   (funcall callback stdout))))))
+                (or stdin (current-buffer)))
+       :callback
+       (lambda (stdout)
+         (when input-fname
+           (delete-file input-fname))
+         (when output-fname
+           ;; Load output-fname contents into the stdout buffer.
+           (with-current-buffer stdout
+             (erase-buffer)
+             (insert-file-contents-literally output-fname))
+           (delete-file output-fname))
+
+         (if (cdr commands)
+             ;; Forward current stdout to remaining formatters, passing along
+             ;; the current callback and using the current formatters output
+             ;; as stdin.
+             (apheleia--run-formatters (cdr commands) callback stdout)
+           (funcall callback stdout)))))))
 
 (defcustom apheleia-formatters
   '((black . ("black" "-"))
@@ -472,8 +518,26 @@ modified from what is written to disk, then don't do anything."
     (terraform . ("terraform" "fmt" "-")))
   "Alist of code formatting commands.
 The keys may be any symbols you want, and the values are
-commands, lists of strings and symbols, in the format of
-`apheleia-format-buffer' (which see)."
+commands, lists of strings and symbols.
+
+In Lisp code, commands is similar to what you pass to
+`make-process', except as follows. Normally, the contents of the
+current buffer are passed to the command on stdin, and the output
+is read from stdout. However, if you use the symbol `file' as one
+of the elements of commands, then the filename of the current
+buffer is substituted for it. (Use `filepath' instead of `file'
+if you need the filename of the current buffer, but you still
+want its contents to be passed on stdin.) If you instead use the
+symbol `input' as one of the elements of commands, then the
+contents of the current buffer are written to a temporary file
+and its name is substituted for `input'. Also, if you use the
+symbol `output' as one of the elements of commands, then it is
+substituted with the name of a temporary file. In that case, it
+is expected that the command writes to that file, and the file is
+then read into an Emacs buffer. Finally, if you use the symbol
+`npx' as one of the elements of commands, then the first string
+element of commands is resolved inside node_modules/.bin if such a
+directory exists anywhere above the current `default-directory'."
   :type '(alist
           :key-type symbol
           :value-type
@@ -519,24 +583,39 @@ symbols (matched against `major-mode' with `derived-mode-p') or
 strings (matched against value of variable `buffer-file-name'
 with `string-match-p'), and the values are symbols with entries
 in `apheleia-formatters' (or equivalently, they are allowed
-values for `apheleia-formatter'). Earlier entries take precedence
-over later ones.
+values for `apheleia-formatter'). Values can be a list of such
+symnols causing each formatter in the list to be called one after
+the other (with the output of the previous formatter).
+Earlier entries in this variable take precedence over later ones.
 
 Be careful when writing regexps to include \"\\'\" and to escape
 \"\\.\" in order to properly match a file extension. For example,
 to match \".jsx\" files you might use \"\\.jsx\\'\"."
   :type '(alist
-          :key-type symbol
-          :value-type symbol))
+          :key-type
+          (choice (symbol :tag "Major mode")
+                  (string :tag "Buffer name regexp"))
+          :value-type
+          (choice (symbol :tag "Formatter")
+                  (repeat
+                   (symbol :tag "Formatter")))))
 
 (defvar-local apheleia-formatter nil
   "Name of formatter to use in current buffer, a symbol or nil.
 If non-nil, then `apheleia-formatters' should have a matching
 entry. This overrides `apheleia-mode-alist'.")
 
-(defun apheleia--get-formatter-command (&optional interactive)
+(defmacro apheleia--ensure-list (arg)
+  "Ensure ARG is a list of length at least 1.
+When ARG is not a list its turned into a list."
+  `(when-let ((val ,arg))
+     (if (listp val)
+         val
+       (list val))))
+
+(defun apheleia--get-formatter-commands (&optional interactive)
   "Return the formatter command to use for the current buffer.
-This is a value suitable for `apheleia--run-formatter', or nil if
+This is a value suitable for `apheleia--run-formatters', or nil if
 no formatter is configured for the current buffer. Consult the
 values of `apheleia-mode-alist' and `apheleia-formatter' to
 determine which formatter is configured.
@@ -545,9 +624,9 @@ If INTERACTIVE is non-nil, then prompt the user for which
 formatter to run if none is configured, instead of returning nil.
 If INTERACTIVE is the special symbol `prompt', then prompt
 even if a formatter is configured."
-  (when-let ((formatter
+  (when-let ((formatters
               (or (and (not (eq interactive 'prompt))
-                       (or apheleia-formatter
+                       (or (apheleia--ensure-list apheleia-formatter)
                            (cl-dolist (entry apheleia-mode-alist)
                              (when (or (and (symbolp (car entry))
                                             (derived-mode-p (car entry)))
@@ -555,18 +634,22 @@ even if a formatter is configured."
                                             buffer-file-name
                                             (string-match-p
                                              (car entry) buffer-file-name)))
-                               (cl-return (cdr entry))))))
+                               (cl-return
+                                (apheleia--ensure-list (cdr entry)))))))
                   (and interactive
-                       (intern
-                        (completing-read
-                         "Formatter: "
-                         (or (map-keys apheleia-formatters)
-                             (user-error
-                              "No formatters in `apheleia-formatters'"))
-                         nil 'require-match))))))
-    (or (alist-get formatter apheleia-formatters)
-        (user-error "No configuration for formatter `%S'"
-                    formatter))))
+                       (list
+                        (intern
+                         (completing-read
+                          "Formatter: "
+                          (or (map-keys apheleia-formatters)
+                              (user-error
+                               "No formatters in `apheleia-formatters'"))
+                          nil 'require-match)))))))
+    (mapcar (lambda (formatter)
+              (or (alist-get formatter apheleia-formatters)
+                  (user-error "No configuration for formatter `%S'"
+                              formatter)))
+            formatters)))
 
 (defun apheleia--buffer-hash ()
   "Compute hash of current buffer."
@@ -583,40 +666,21 @@ even if a formatter is configured."
     "Apheleia does not support remote files"))
 
 ;;;###autoload
-(defun apheleia-format-buffer (command &optional callback)
+(defun apheleia-format-buffer (commands &optional callback)
   "Run code formatter asynchronously on current buffer, preserving point.
 
-Interactively, run the currently configured formatter (see
+COMMANDS is a list of the values from `apheleia-formatters'. If
+called interactively, run the currently configured formatters (see
 `apheleia-formatter' and `apheleia-mode-alist'), or prompt from
 `apheleia-formatters' if there is none configured for the current
 buffer. With a prefix argument, prompt always.
 
-In Lisp code, COMMAND is similar to what you pass to
-`make-process', except as follows. Normally, the contents of the
-current buffer are passed to the command on stdin, and the output
-is read from stdout. However, if you use the symbol `file' as one
-of the elements of COMMAND, then the filename of the current
-buffer is substituted for it. (Use `filepath' instead of `file'
-if you need the filename of the current buffer, but you still
-want its contents to be passed on stdin.) If you instead use the
-symbol `input' as one of the elements of COMMAND, then the
-contents of the current buffer are written to a temporary file
-and its name is substituted for `input'. Also, if you use the
-symbol `output' as one of the elements of COMMAND, then it is
-substituted with the name of a temporary file. In that case, it
-is expected that the command writes to that file, and the file is
-then read into an Emacs buffer. Finally, if you use the symbol
-`npx' as one of the elements of COMMAND, then the first string
-element of COMMAND is resolved inside node_modules/.bin if such a
-directory exists anywhere above the current `default-directory'.
-
-In any case, after the formatter finishes running, the diff
-utility is invoked to determine what changes it made. That diff
-is then used to apply the formatter's changes to the current
-buffer without moving point or changing the scroll position in
-any window displaying the buffer. If the buffer has been modified
-since the formatter started running, however, the operation is
-aborted.
+After the formatters finish running, the diff utility is invoked to
+determine what changes it made. That diff is then used to apply the
+formatter's changes to the current buffer without moving point or
+changing the scroll position in any window displaying the buffer. If
+the buffer has been modified since the formatter started running,
+however, the operation is aborted.
 
 If the formatter actually finishes running and the buffer is
 successfully updated (even if the formatter has not made any
@@ -624,7 +688,7 @@ changes), CALLBACK, if provided, is invoked with no arguments."
   (interactive (progn
                  (when-let ((err (apheleia--disallowed-p)))
                    (user-error err))
-                 (list (apheleia--get-formatter-command
+                 (list (apheleia--get-formatter-commands
                         (if current-prefix-arg
                             'prompt
                           'interactive)))))
@@ -633,8 +697,8 @@ changes), CALLBACK, if provided, is invoked with no arguments."
   (unless (apheleia--disallowed-p)
     (setq-local apheleia--buffer-hash (apheleia--buffer-hash))
     (let ((cur-buffer (current-buffer)))
-      (apheleia--run-formatter
-       command
+      (apheleia--run-formatters
+       commands
        (lambda (formatted-buffer)
          (with-current-buffer cur-buffer
            ;; Short-circuit.
@@ -669,9 +733,9 @@ operating, to prevent an infinite loop.")
   "Run code formatter for current buffer if any configured, then save."
   (unless apheleia--format-after-save-in-progress
     (when apheleia-mode
-      (when-let ((command (apheleia--get-formatter-command)))
+      (when-let ((commands (apheleia--get-formatter-commands)))
         (apheleia-format-buffer
-         command
+         commands
          (lambda ()
            (with-demoted-errors "Apheleia: %s"
              (let ((apheleia--format-after-save-in-progress t))
