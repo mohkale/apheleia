@@ -101,12 +101,6 @@ variables:
       This will make apheleia run `isort` on the current buffer and then
       `black` on the result of `isort` and then use the final output to
       format the current buffer.
-
-      **Warn**: At the moment there's no smart or configurable error
-      handling in place. This means if one of the configured
-      formatters fail (for example if `isort` isn't installed) then
-      apheleia just doesn't format the buffer at all, even if `black`
-      is installed.
 * `apheleia-formatter`: Optional buffer-local variable specifying the
   formatter to use in this buffer. Overrides `apheleia-mode-alist`.
 

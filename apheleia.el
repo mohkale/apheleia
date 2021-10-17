@@ -600,6 +600,18 @@ to match \".jsx\" files you might use \"\\.jsx\\'\"."
                   (repeat
                    (symbol :tag "Formatter")))))
 
+(defcustom apheleia-format-strategy 'cancel
+  "Strategy for missing or failing formatters.
+This variable comes in useful when running multiple formatters on the
+same buffer.
+
+When set to `cancel' the formatting is completely abandoned as soon as
+one of the configured formatters fails. When set to `skip' a failing
+formatter is ignored and the remaining formatters will still be run."
+  :type '(choice
+          (const :tag "Cancel on first failing formatter" cancel)
+          (const :tag "Ignore failing formatters" skip)))
+
 (defvar-local apheleia-formatter nil
   "Name of formatter to use in current buffer, a symbol or nil.
 If non-nil, then `apheleia-formatters' should have a matching
