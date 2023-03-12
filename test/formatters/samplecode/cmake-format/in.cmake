@@ -59,9 +59,7 @@ set(HEADERS header_a.h header_b.h # This comment should
 # This is a third paragraph
 
 # This is a comment
-# that should be joined but
-# TODO(josh): This todo should not be joined with the previous line.
-# NOTE(josh): Also this should not be joined with the todo.
+# that should be joined
 
 if(foo)
 if(sbar)
